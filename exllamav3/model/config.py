@@ -6,6 +6,7 @@ from ..util.rope import RopeSettings, RopeStyle
 from ..loader import SafetensorsCollection
 from ..util.file import read_dict, no_value, no_default
 import uuid
+from .moe_placement import normalize_expert_device_map
 
 @dataclass
 class InferParams:
@@ -57,6 +58,11 @@ class InferParams:
         # per-forward row gathers instead of loading the whole table into system RAM (tens of
         # GB). Set before loading the model
         self.ngram_stream_from_disk = os.environ.get("EXL3_NGRAM_STREAM", "1") != "0"
+        # Optional expert-aware placement controls
+        self.expert_device_map = {}
+        self.expert_profile = None
+        self.moe_device_weights = {}
+        self.moe_device_capacities = {}
 
     def use_mgemm(self, K: int, out_features: int, mul1: bool = False, device = None) -> bool:
         # Unfusing only pays when the separate GEMV calls can actually take the int8 path, which
@@ -176,6 +182,49 @@ class Config(ABC):
 
         # Inference parameters
         self.infer_params = InferParams()
+        # Alias for convenience on Config
+        self.expert_device_map = self.infer_params.expert_device_map
+        self.expert_profile = self.infer_params.expert_profile
+        self.moe_device_weights = self.infer_params.moe_device_weights
+        self.moe_device_capacities = self.infer_params.moe_device_capacities
+
+
+    def set_expert_device(self, layer: int | str, expert: int, device: int):
+        m = normalize_expert_device_map({(layer, expert): device})
+        merged = normalize_expert_device_map(self.infer_params.expert_device_map)
+        for lk, lv in m.items():
+            merged.setdefault(lk, {}).update(lv)
+        self.infer_params.expert_device_map = merged
+        self.expert_device_map = self.infer_params.expert_device_map
+
+
+    def set_expert_device_map(self, expert_device_map: dict):
+        self.infer_params.expert_device_map = normalize_expert_device_map(expert_device_map)
+        self.expert_device_map = self.infer_params.expert_device_map
+
+
+    def clear_expert_device_map(self):
+        self.infer_params.expert_device_map = {}
+        self.expert_device_map = self.infer_params.expert_device_map
+
+
+    def set_expert_profile(self, profile: dict | str):
+        self.infer_params.expert_profile = profile
+        self.expert_profile = self.infer_params.expert_profile
+
+
+    def set_moe_device_weights(self, device_weights: dict[int, float]):
+        self.infer_params.moe_device_weights = {
+            int(k): float(v) for k, v in device_weights.items()
+        }
+        self.moe_device_weights = self.infer_params.moe_device_weights
+
+
+    def set_moe_device_capacities(self, device_capacities: dict[int, int]):
+        self.infer_params.moe_device_capacities = {
+            int(k): int(v) for k, v in device_capacities.items()
+        }
+        self.moe_device_capacities = self.infer_params.moe_device_capacities
 
 
     def get_tensor_name_fixes(self):

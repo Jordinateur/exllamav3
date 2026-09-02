@@ -66,6 +66,10 @@ def add_args(
     parser.add_argument("-tp_linear", "--tp_max_parallelism_linear", type = int, help = "(TP) Maximum parallelism for linear (output) layers", default = None)
     parser.add_argument("-tp_linear_attn", "--tp_max_parallelism_linear_attn", type = int, help = "(TP) Maximum parallelism for linear-attention layers", default = None)
     parser.add_argument("-tp_moe_ts", "--tp_moe_tensor_split", action = "store_true", help = "(TP) Use tensor split for MoE layers rather than expert parallelism")
+    parser.add_argument("--expert_device_map", type = str, help = "JSON file containing expert placement overrides", default = None)
+    parser.add_argument("--expert_profile", type = str, help = "JSON file containing per-layer expert frequencies for profile-based placement", default = None)
+    parser.add_argument("--moe_device_weights", type = str, help = "Comma-separated device:weight list for profile placement, e.g. 0:1.0,1:0.7", default = None)
+    parser.add_argument("--moe_device_caps", type = str, help = "Comma-separated device:capacityGB list for profile placement, e.g. 0:22,1:12", default = None)
 
     parser.add_argument("-swa_full", "--swa_full", action = "store_true", help = f"Use full cache for SWA layers. Default is recurrent mode with snapshots")
     parser.add_argument("-ambs", "--autosplit_max_batch_size", type = int, help = f"Max batch size to account for when loading in autosplit mode (default: {default_autosplit_max_batch_size})", default = default_autosplit_max_batch_size)
@@ -198,6 +202,24 @@ def init(
 
     # Config
     config = Config.from_directory(args.model_dir, layer_map = args.layer_map)
+    if getattr(args, "expert_device_map", None):
+        with open(args.expert_device_map, "r", encoding = "utf8") as f:
+            config.set_expert_device_map(yaml.safe_load(f))
+    if getattr(args, "expert_profile", None):
+        with open(args.expert_profile, "r", encoding = "utf8") as f:
+            config.set_expert_profile(yaml.safe_load(f))
+    if getattr(args, "moe_device_weights", None):
+        d = {}
+        for item in args.moe_device_weights.split(","):
+            k, v = item.split(":")
+            d[int(k)] = float(v)
+        config.set_moe_device_weights(d)
+    if getattr(args, "moe_device_caps", None):
+        d = {}
+        for item in args.moe_device_caps.split(","):
+            k, v = item.split(":")
+            d[int(k)] = int(float(v) * 1024**3)
+        config.set_moe_device_capacities(d)
     if getattr(args, "moe_cpu_offload", 0):
         assert not args.tensor_parallel, "--moe_cpu_offload currently requires layer-split mode"
         config.infer_params.moe_cpu_offload = args.moe_cpu_offload
