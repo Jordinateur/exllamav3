@@ -14,8 +14,12 @@ from ..cache.recurrent_util import advance_recurrent_states
 from .moe_placement import (
     normalize_expert_device_map,
     MoeLayerPlanInput,
+    LayerDevicePlanInput,
     allocate_experts_from_profile,
-    estimate_override_bytes_per_device,
+    plan_layer_devices,
+    resolve_layer_expert_overrides,
+    resolve_profile_layer,
+    validate_layer_overrides,
 )
 from ..modules.block_sparse_mlp import BlockSparseMLP
 
@@ -323,23 +327,263 @@ class Model(Model_TPMixin, Model_LSMixin):
                     layer_idx = module.infer_layer_idx(),
                     num_experts = module.num_experts,
                     expert_size_bytes = module.estimate_expert_storage_size(),
+                    expert_storage_sizes = tuple(module.estimate_expert_storage_sizes()),
                 ))
         return specs
 
 
-    def _expert_reserve_with_safety(self, bytes_per_device: dict[int, int]) -> dict[int, int]:
-        # Conservative headroom for allocator fragmentation and small runtime buffers while expert
-        # placement is active. Tunable for tight systems.
-        margin_mb = int(os.environ.get("EXL3_MOE_EXPERT_RESERVE_MB", "1024"))
-        ratio = float(os.environ.get("EXL3_MOE_EXPERT_RESERVE_RATIO", "1.05"))
-        margin = margin_mb * 1024**2
-        out = {}
-        for d, b in bytes_per_device.items():
-            if b <= 0:
-                out[d] = 0
+    @staticmethod
+    def _module_storage_size(module, excluded_ids: set[int] | frozenset[int] = frozenset()) -> int:
+        """Estimate persistent storage for a module without double-counting composite modules.
+
+        Most composite modules expose storage through their own ``storage_size`` implementation,
+        while ``BlockSparseMLP`` deliberately has no aggregate implementation because expert
+        tensors can live on different devices.  When expert leaves are excluded, recurse through
+        the composite and count only the remaining leaves.  Attached KV/recurrent states are
+        included here because they are allocated by the module's ``load_local`` path and are not
+        part of ``Module.modules``.
+        """
+
+        excluded_ids = frozenset(excluded_ids)
+        contains_cache = {}
+
+        def has_excluded(node) -> bool:
+            ident = id(node)
+            if ident in contains_cache:
+                return contains_cache[ident]
+            result = ident in excluded_ids or any(
+                has_excluded(child) for child in getattr(node, "modules", ())
+            )
+            contains_cache[ident] = result
+            return result
+
+        def attached_storage(node) -> int:
+            total = 0
+            seen = set()
+            for attr in ("cache_layers", "recurrent_layers"):
+                for state in getattr(node, attr, ()) or ():
+                    if id(state) in seen:
+                        continue
+                    seen.add(id(state))
+                    fn = getattr(state, "storage_size", None)
+                    if callable(fn):
+                        total += int(fn())
+            return total
+
+        def visit(node) -> int:
+            if id(node) in excluded_ids:
+                return 0
+            children = tuple(getattr(node, "modules", ()) or ())
+            fn = getattr(node, "storage_size", None)
+            # A composite aggregate is valid only when no excluded expert is below it.  Otherwise
+            # recurse so the expert leaves can be removed from the estimate.
+            if callable(fn) and (not children or not has_excluded(node)):
+                return int(fn()) + attached_storage(node)
+            if not children:
+                return (int(fn()) if callable(fn) else 0) + attached_storage(node)
+            return attached_storage(node) + sum(visit(child) for child in children)
+
+        return visit(module)
+
+
+    @staticmethod
+    def _device_load_budgets(
+        active_devices: list[int],
+        reserve_per_device: list[int] | None,
+        use_per_device: list[int] | None,
+    ) -> dict[int, int]:
+        """Return the same cumulative allocator budgets used by the load helpers."""
+
+        budgets = {}
+        for device in active_devices:
+            current = int(torch.cuda.memory_reserved(device))
+            if reserve_per_device is not None:
+                free, _ = torch.cuda.mem_get_info(device)
+                budget = current + int(free) - int(reserve_per_device[device])
+            elif use_per_device is not None:
+                budget = current + int(use_per_device[device])
             else:
-                out[d] = int(b * ratio) + margin
-        return out
+                raise RuntimeError("Logic error: one of reserve_per_device/use_per_device is required")
+            budgets[device] = max(0, int(budget))
+        return budgets
+
+
+    def _plan_expert_aware_layers(
+        self,
+        modules: list,
+        active_devices: list[int],
+        reserve_per_device: list[int] | None,
+        use_per_device: list[int] | None,
+        verbose: bool,
+    ) -> list[int]:
+        """Run the two-pass expert-aware layer planner.
+
+        Pass one is the profile/manual expert map already constructed in ``load_gen``.  This pass
+        converts that map into fixed per-device expert storage and candidate base-module costs.
+        ``plan_layer_devices`` then selects the base device for every top-level module before any
+        CUDA weight is materialized.
+        """
+
+        normalized_map = normalize_expert_device_map(
+            getattr(self.config.infer_params, "expert_device_map", {})
+        )
+        if not normalized_map:
+            return [active_devices[0]] * len(modules)
+
+        num_devices = torch.cuda.device_count()
+        fixed_storage = {d: 0 for d in active_devices}
+        layer_specs = []
+
+        profile = getattr(self.config.infer_params, "expert_profile", None)
+        if isinstance(profile, str):
+            with open(profile, "r", encoding = "utf8") as f:
+                profile = json.load(f)
+
+        for module in modules:
+            moe_modules = [m for m in module if isinstance(m, BlockSparseMLP)]
+            expert_modules = set()
+            for moe in moe_modules:
+                expert_modules.update(id(x) for x in (
+                    (moe.gates if moe.gated else []) + moe.ups + moe.downs
+                ))
+
+            base_storage = self._module_storage_size(module, expert_modules)
+            storage_by_device = {}
+            affinity_by_device = {}
+
+            # CPU-preferred modules do not consume CUDA persistent storage.  They still appear in
+            # the top-level sequence so the second-pass path can preserve their ordering.
+            if module.caps.get("prefer_cpu"):
+                if moe_modules:
+                    raise NotImplementedError(
+                        f"{module.key}: expert-aware placement cannot target a CPU-preferred MoE module"
+                    )
+                for device in active_devices:
+                    storage_by_device[device] = 0
+                    affinity_by_device[device] = 0.0
+                layer_specs.append(LayerDevicePlanInput(
+                    module_key = module.key,
+                    storage_by_device = storage_by_device,
+                    affinity_by_device = affinity_by_device,
+                ))
+                continue
+
+            # Fixed expert tensors are counted once, independently of the module's eventual base
+            # device. Experts without an explicit target remain part of the candidate base cost.
+            local_affinity = {d: 0.0 for d in active_devices}
+            total_affinity = 0.0
+            for moe in moe_modules:
+                overrides = resolve_layer_expert_overrides(
+                    normalized_map, moe.infer_layer_idx(), moe.key
+                )
+                validate_layer_overrides(
+                    overrides,
+                    layer_name = moe.key,
+                    num_experts = moe.num_experts,
+                    num_devices = num_devices,
+                )
+                expert_sizes = moe.estimate_expert_storage_sizes()
+                if len(expert_sizes) != moe.num_experts:
+                    raise ValueError(
+                        f"{moe.key}: expert-aware placement requires all experts to be materialized "
+                        f"({len(expert_sizes)} local, {moe.num_experts} declared)"
+                    )
+                freqs = None
+                if isinstance(profile, dict):
+                    freqs = resolve_profile_layer(
+                        profile,
+                        layer_idx = moe.infer_layer_idx(),
+                        layer_key = moe.key,
+                        num_experts = moe.num_experts,
+                    )
+                if freqs is None:
+                    freqs = [1.0] * len(expert_sizes)
+                freqs = [max(0.0, float(x)) for x in freqs]
+                freq_total = sum(freqs)
+                if freq_total <= 0.0:
+                    freqs = [1.0] * len(expert_sizes)
+                    freq_total = float(len(expert_sizes))
+                for expert_idx, expert_size in enumerate(expert_sizes):
+                    affinity = freqs[expert_idx] / freq_total
+                    total_affinity += affinity
+                    target = overrides.get(expert_idx)
+                    if target is None:
+                        continue
+                    if target not in fixed_storage:
+                        raise ValueError(
+                            f"{moe.key}: expert {expert_idx} targets inactive cuda:{target}"
+                        )
+                    fixed_storage[target] += expert_size
+                    local_affinity[target] += affinity
+
+            for device in active_devices:
+                candidate_storage = base_storage
+                candidate_affinity = local_affinity[device]
+                for moe in moe_modules:
+                    overrides = resolve_layer_expert_overrides(
+                        normalized_map, moe.infer_layer_idx(), moe.key
+                    )
+                    expert_sizes = moe.estimate_expert_storage_sizes()
+                    freqs = None
+                    if isinstance(profile, dict):
+                        freqs = resolve_profile_layer(
+                            profile,
+                            layer_idx = moe.infer_layer_idx(),
+                            layer_key = moe.key,
+                            num_experts = moe.num_experts,
+                        )
+                    if freqs is None:
+                        freqs = [1.0] * len(expert_sizes)
+                    freqs = [max(0.0, float(x)) for x in freqs]
+                    freq_total = sum(freqs)
+                    if freq_total <= 0.0:
+                        freqs = [1.0] * len(expert_sizes)
+                        freq_total = float(len(expert_sizes))
+                    for expert_idx, expert_size in enumerate(expert_sizes):
+                        if expert_idx not in overrides:
+                            candidate_storage += expert_size
+                            candidate_affinity += freqs[expert_idx] / freq_total
+                storage_by_device[device] = int(candidate_storage)
+                affinity_by_device[device] = (
+                    candidate_affinity / max(1.0, total_affinity)
+                )
+
+            layer_specs.append(LayerDevicePlanInput(
+                module_key = module.key,
+                storage_by_device = storage_by_device,
+                affinity_by_device = affinity_by_device,
+            ))
+
+        budgets = self._device_load_budgets(
+            active_devices, reserve_per_device, use_per_device
+        )
+        headroom_mb = int(os.environ.get("EXL3_MOE_PLAN_HEADROOM_MB", "512"))
+        device_plan, usage = plan_layer_devices(
+            layer_specs,
+            active_devices = active_devices,
+            device_budgets = budgets,
+            fixed_storage_by_device = fixed_storage,
+            device_weights = getattr(self.config.infer_params, "moe_device_weights", None),
+            headroom_bytes = max(0, headroom_mb) * 1024**2,
+        )
+
+        if verbose:
+            fixed_gb = ", ".join(
+                f"cuda:{d}={fixed_storage[d] / 1024**3:.2f} GiB"
+                for d in active_devices
+            )
+            usage_gb = ", ".join(
+                f"cuda:{d}={usage[d] / 1024**3:.2f} GiB"
+                for d in active_devices
+            )
+            print(f" -- Expert pass: fixed expert storage ({fixed_gb})")
+            print(f" -- Layer pass: planned storage ({usage_gb})")
+            print(" -- Layer pass: " + ", ".join(
+                f"{modules[i].key}->cuda:{device_plan[i]}"
+                for i in range(len(modules))
+            ))
+
+        return device_plan
 
 
     def load_gen(
@@ -507,8 +751,8 @@ class Model(Model_TPMixin, Model_LSMixin):
             upd = use_per_device is not None
             assert not (rpd and upd), \
                 "Cannot specify both reserve_per_device or use_per_device."
-            profile_reserved = False
             num_devices = torch.cuda.device_count()
+            layer_device_plan = None
 
             if not upd:
                 if reserve_per_device is None:
@@ -545,70 +789,23 @@ class Model(Model_TPMixin, Model_LSMixin):
                     device_capacities = self.config.infer_params.moe_device_capacities,
                     default_device = profile_default_device,
                 )
-                # Reserve extra room for profile-assigned experts that are placed off the profile
-                # default device before autosplit starts assigning dense modules.
-                profile_override_bytes = estimate_override_bytes_per_device(
-                    self._moe_layer_specs(),
-                    prof_map,
-                    active_devices = active_devices,
-                    default_device = profile_default_device,
-                )
-                profile_override_bytes = self._expert_reserve_with_safety(profile_override_bytes)
-                if upd:
-                    for d, extra in profile_override_bytes.items():
-                        if extra <= 0:
-                            continue
-                        if d >= len(use_per_device):
-                            continue
-                        use_per_device[d] -= extra
-                        if use_per_device[d] <= 0:
-                            raise RuntimeError(
-                                f"expert profile placement reserves too much memory on cuda:{d}; "
-                                f"reduce profile pressure or increase --gpu_split/--moe_device_caps"
-                            )
-                else:
-                    for d, extra in profile_override_bytes.items():
-                        if extra <= 0:
-                            continue
-                        if d >= len(reserve_per_device):
-                            continue
-                        reserve_per_device[d] += extra
-                profile_reserved = True
                 merged = normalize_expert_device_map(self.config.infer_params.expert_device_map)
                 for lk, lv in prof_map.items():
                     merged.setdefault(lk, {}).update(lv)
                 self.config.infer_params.expert_device_map = merged
                 self.config.expert_device_map = merged
 
-            # Expert-aware placement can allocate expert tensors on devices other than the module's
-            # autosplit load device. Reserve that room conservatively up front so autosplit does
-            # not overfill a target device with dense modules first.
-            if self.config.infer_params.expert_device_map and not tensor_p and not profile_reserved:
-                override_bytes = estimate_override_bytes_per_device(
-                    self._moe_layer_specs(),
-                    self.config.infer_params.expert_device_map,
-                    active_devices = active_devices,
+            # Expert-aware loading is planned before any CUDA module is materialized.  The planner
+            # accounts fixed expert targets and chooses a base device for every top-level module;
+            # the loader then executes that plan in its second pass.
+            if self.config.infer_params.expert_device_map and not tensor_p:
+                layer_device_plan = self._plan_expert_aware_layers(
+                    self.modules,
+                    active_devices,
+                    reserve_per_device,
+                    use_per_device,
+                    verbose,
                 )
-                override_bytes = self._expert_reserve_with_safety(override_bytes)
-                if upd:
-                    for d, extra in override_bytes.items():
-                        if extra <= 0:
-                            continue
-                        if d >= len(use_per_device):
-                            continue
-                        use_per_device[d] -= extra
-                        if use_per_device[d] <= 0:
-                            raise RuntimeError(
-                                f"expert-aware placement reserves too much memory on cuda:{d}; "
-                                f"reduce expert map pressure or increase --gpu_split/--moe_device_caps"
-                            )
-                else:
-                    for d, extra in override_bytes.items():
-                        if extra <= 0:
-                            continue
-                        if d >= len(reserve_per_device):
-                            continue
-                        reserve_per_device[d] += extra
 
             # Split load
             if not tensor_p:
@@ -628,6 +825,7 @@ class Model(Model_TPMixin, Model_LSMixin):
                     max_batch_size,
                     self.cache_weakrefs,
                     autosplit_no_forward,
+                    layer_device_plan,
                 )
                 self.output_device = self.modules[-1].device
 

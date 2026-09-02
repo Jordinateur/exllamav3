@@ -656,11 +656,24 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
     def estimate_expert_storage_size(self) -> int:
         if self.num_experts == 0:
             return 0
-        i = 0
-        sz = self.ups[i].storage_size() + self.downs[i].storage_size()
-        if self.gated:
-            sz += self.gates[i].storage_size()
-        return sz
+        return self.estimate_expert_storage_sizes()[0]
+
+
+    def estimate_expert_storage_sizes(self) -> list[int]:
+        """Return persistent storage for every locally materialized expert.
+
+        Expert tensors are normally uniform, but sliced/padded checkpoints can make the exact
+        footprint differ by expert.  The placement planner uses this list when it is available;
+        the legacy scalar estimate remains exposed for callers that only need a representative
+        size.
+        """
+        sizes = []
+        for i in range(len(self.ups)):
+            sz = self.ups[i].storage_size() + self.downs[i].storage_size()
+            if self.gated:
+                sz += self.gates[i].storage_size()
+            sizes.append(int(sz))
+        return sizes
 
 
     def enable_expert_profiling(self, enabled: bool = True, reset: bool = False):

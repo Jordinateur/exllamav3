@@ -77,12 +77,31 @@ class Model_LSMixin(ABC):
         max_batch_size: int,
         cache_weakrefs: dict,
         autosplit_no_forward: bool,
+        device_plan: list[int] | None = None,
     ):
         current_device_i = 0
         backup_shape, backup_dtype = self.default_load_shape_dtype(max_chunk_size)
         dummy_state = None
         prev_load_device = None
         touched_devices = []
+        # Expert-aware placement may load a remote expert while the current top-level module is
+        # still assigned to another GPU.  Install the normal cumulative allocator limits on every
+        # planned device before the first module is materialized, so those remote allocations are
+        # subject to the same budget.  Expert bytes are already included in the plan; they must not
+        # be added to reserve_per_device (which means free headroom, not an expert budget).
+        prelimited_devices = set()
+        if device_plan is not None:
+            if len(device_plan) != len(modules):
+                raise ValueError("device_plan length must match the top-level module list")
+            for i in active_devices:
+                if reserve_per_device is not None:
+                    set_memory_fraction_reserve(reserve_per_device[i], i)
+                elif use_per_device is not None:
+                    set_memory_fraction_use(use_per_device[i], i)
+                else:
+                    raise RuntimeError("Logic error")
+                prelimited_devices.add(i)
+            touched_devices.extend(active_devices)
         params = self.default_load_params(max_chunk_size)
         # The measuring forwards below exist to observe VRAM allocation; modules with CPU-side
         # compute (CPU-offloaded experts) can skip the host work when they see this flag
@@ -130,24 +149,33 @@ class Model_LSMixin(ABC):
 
                 while True:
                     try:
-                        # Select device
-                        load_device = torch.device("cpu") if module.caps.get("prefer_cpu") else \
-                            torch.device(active_devices[current_device_i])
-                        x_device = torch.device("cpu") if module.caps.get("prefer_cpu") or module.caps.get("x_cpu") else \
-                            torch.device(active_devices[current_device_i])
+                        # Select device.  A two-pass expert-aware load uses the precomputed base
+                        # device; legacy loads retain the sequential autosplit cursor below.
+                        if device_plan is not None:
+                            planned_device = device_plan[idx]
+                            load_device = torch.device("cpu") if module.caps.get("prefer_cpu") else \
+                                torch.device(planned_device)
+                            x_device = torch.device("cpu") if module.caps.get("prefer_cpu") or module.caps.get("x_cpu") else \
+                                torch.device(planned_device)
+                        else:
+                            load_device = torch.device("cpu") if module.caps.get("prefer_cpu") else \
+                                torch.device(active_devices[current_device_i])
+                            x_device = torch.device("cpu") if module.caps.get("prefer_cpu") or module.caps.get("x_cpu") else \
+                                torch.device(active_devices[current_device_i])
 
                         # Set VRAM limit if new device
                         if load_device != torch.device("cpu") and load_device != prev_load_device:
                             prev_load_device = load_device
-                            i = active_devices[current_device_i]
-                            touched_devices.append(i)
-                            i = active_devices[current_device_i]
-                            if reserve_per_device is not None:
-                                set_memory_fraction_reserve(reserve_per_device[i], i)
-                            elif use_per_device is not None:
-                                set_memory_fraction_use(use_per_device[i], i)
-                            else:
-                                raise RuntimeError("Logic error")
+                            i = planned_device if device_plan is not None else active_devices[current_device_i]
+                            if i not in prelimited_devices:
+                                touched_devices.append(i)
+                                if reserve_per_device is not None:
+                                    set_memory_fraction_reserve(reserve_per_device[i], i)
+                                elif use_per_device is not None:
+                                    set_memory_fraction_use(use_per_device[i], i)
+                                else:
+                                    raise RuntimeError("Logic error")
+                                prelimited_devices.add(i)
 
                         # (Re)create or backup hidden state (metadata)
                         if dummy_state is None:
@@ -217,6 +245,14 @@ class Model_LSMixin(ABC):
                                 rs.reset()
 
                         free_mem()
+                        if device_plan is not None:
+                            planned_device = device_plan[idx]
+                            raise RuntimeError(
+                                f"Two-pass expert-aware placement does not fit module "
+                                f"{module.key!r} on cuda:{planned_device}; "
+                                "reduce cache/chunk size, increase --gpu_split, or reduce "
+                                "expert placement pressure"
+                            ) from None
                         current_device_i += 1
                         if current_device_i >= len(active_devices):
                             raise RuntimeError("Insufficient VRAM in split for model and cache")
@@ -276,4 +312,3 @@ class Model_LSMixin(ABC):
             x = module.prepare_for_device(x, params)
             x = module.forward(x, params)
         return x
-

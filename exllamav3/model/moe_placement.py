@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -154,6 +154,151 @@ class MoeLayerPlanInput:
     layer_idx: int | None
     num_experts: int
     expert_size_bytes: int
+    # Most checkpoints have identically-sized experts.  Keeping the optional per-expert sizes
+    # here makes the planner correct for sliced/padded or otherwise irregular expert tensors while
+    # retaining the four-argument API used by existing callers.
+    expert_storage_sizes: tuple[int, ...] | None = None
+
+    def expert_size(self, expert_idx: int) -> int:
+        if self.expert_storage_sizes is not None and expert_idx < len(self.expert_storage_sizes):
+            return int(self.expert_storage_sizes[expert_idx])
+        return int(self.expert_size_bytes)
+
+
+@dataclass
+class LayerDevicePlanInput:
+    """One top-level layer/module considered by the layer-split planner.
+
+    ``storage_by_device`` is the persistent storage needed when this module's non-expert/base
+    tensors are placed on a candidate device.  Expert tensors with an explicit target device are
+    accounted for separately in ``fixed_storage_by_device`` passed to :func:`plan_layer_devices`.
+    """
+
+    module_key: str
+    storage_by_device: dict[int, int]
+    affinity_by_device: dict[int, float] = field(default_factory=dict)
+
+
+def plan_layer_devices(
+    layer_specs: list[LayerDevicePlanInput],
+    *,
+    active_devices: list[int],
+    device_budgets: dict[int, int],
+    fixed_storage_by_device: dict[int, int] | None = None,
+    device_weights: dict[int, float] | None = None,
+    headroom_bytes: int = 0,
+    beam_width: int = 128,
+) -> tuple[list[int], dict[int, int]]:
+    """Plan base devices for a layer-split load after expert targets are known.
+
+    This is the second pass of expert-aware loading.  The first pass fixes all explicitly targeted
+    expert tensors and records their storage on the target GPUs.  This pass assigns each top-level
+    module's remaining/base tensors while respecting those fixed allocations and a per-device
+    budget.  A small beam search is used instead of the old online OOM/retry loop: it can keep
+    enough alternatives when an early greedy choice would strand a later large module.
+
+    The returned usage includes both fixed expert storage and the selected base-module storage.
+    ``headroom_bytes`` is subtracted from every device before planning; it is not an allocator
+    reservation and therefore does not double-count expert tensors at load time.
+    """
+
+    if not active_devices:
+        raise ValueError("active_devices must be non-empty")
+    if beam_width < 1:
+        raise ValueError("beam_width must be positive")
+    if headroom_bytes < 0:
+        raise ValueError("headroom_bytes must be non-negative")
+
+    devices = list(active_devices)
+    weights = {d: 1.0 for d in devices}
+    if device_weights:
+        for d, w in device_weights.items():
+            if d in weights:
+                weights[d] = float(w)
+
+    fixed = {d: int((fixed_storage_by_device or {}).get(d, 0)) for d in devices}
+    usable = {}
+    for d in devices:
+        if d not in device_budgets:
+            raise ValueError(f"Missing memory budget for active cuda:{d}")
+        budget = int(device_budgets[d]) - int(headroom_bytes)
+        if budget < 0:
+            raise ValueError(f"Headroom exceeds memory budget on cuda:{d}")
+        if fixed[d] > budget:
+            raise RuntimeError(
+                f"Expert placement requires {fixed[d] / 1024**3:.2f} GiB on cuda:{d}, "
+                f"but only {budget / 1024**3:.2f} GiB is available after headroom"
+            )
+        usable[d] = budget - fixed[d]
+
+    device_pos = {d: i for i, d in enumerate(devices)}
+    # A lower bound for the remaining total storage lets the beam discard states that cannot
+    # possibly fit all subsequent modules, without assuming a particular GPU assignment.
+    suffix_min = [0] * (len(layer_specs) + 1)
+    for i in range(len(layer_specs) - 1, -1, -1):
+        spec = layer_specs[i]
+        if not spec.storage_by_device:
+            raise ValueError(f"{spec.module_key}: no candidate devices")
+        suffix_min[i] = suffix_min[i + 1] + min(
+            max(0, int(spec.storage_by_device.get(d, 0))) for d in devices
+        )
+
+    # State: (score, remaining tuple, previous device, path tuple).  Remaining is indexed by
+    # active_devices and is sufficient to identify equivalent future states.
+    # Start from the first active device, matching legacy layer-split autosplit behavior.  The
+    # planner can still choose a different GPU immediately when the first module or its affinity
+    # makes that preferable.
+    states = [(0.0, tuple(usable[d] for d in devices), devices[0], ())]
+    for i, spec in enumerate(layer_specs):
+        expanded = []
+        for score0, rem0, previous, path in states:
+            candidates = []
+            for d in devices:
+                need = int(spec.storage_by_device.get(d, 0))
+                if need < 0:
+                    raise ValueError(f"{spec.module_key}: negative storage estimate for cuda:{d}")
+                pos = device_pos[d]
+                if need > rem0[pos]:
+                    continue
+                rem = list(rem0)
+                rem[pos] -= need
+                if sum(rem) < suffix_min[i + 1]:
+                    continue
+
+                affinity = float(spec.affinity_by_device.get(d, 0.0))
+                # Affinity keeps an MoE layer close to the GPUs holding its hottest experts;
+                # locality remains a strong tie-breaker for ordinary dense layers.
+                locality = 1.0 if previous == d else 0.0
+                pressure = need / max(1, usable[d])
+                score = score0 + affinity * 1000.0 + locality * 2.0 \
+                    + weights[d] * 0.1 - pressure * 0.01
+                candidates.append((score, tuple(rem), d, path + (d,)))
+            expanded.extend(candidates)
+
+        if not expanded:
+            raise RuntimeError(
+                f"No feasible two-pass layer placement for module {spec.module_key!r}; "
+                "reduce cache/chunk size, increase GPU budgets, or reduce expert placement pressure"
+            )
+
+        # Keep the best path for an equivalent resource state, then retain the highest-scoring
+        # states. This bounds planning cost while preserving alternatives across GPUs.
+        best_by_state = {}
+        for state in expanded:
+            key = (state[1], state[2])
+            old = best_by_state.get(key)
+            if old is None or state[0] > old[0]:
+                best_by_state[key] = state
+        states = sorted(best_by_state.values(), key = lambda s: s[0], reverse = True)[:beam_width]
+
+    best = max(states, key = lambda s: s[0])
+    path = list(best[3])
+    remaining = best[1]
+    usage = {
+        d: fixed[d] + usable[d] - remaining[pos]
+        for pos, d in enumerate(devices)
+    }
+    return path, usage
 
 
 def allocate_experts_from_profile(
@@ -205,21 +350,30 @@ def allocate_experts_from_profile(
         best_score = None
         for d in active_devices:
             cap = device_capacities.get(d) if device_capacities else None
-            if cap is not None and usage[d] + layer.expert_size_bytes > cap:
+            expert_size = layer.expert_size(expert_idx)
+            if cap is not None and usage[d] + expert_size > cap:
                 continue
             load_penalty = 0.0
             if cap:
-                load_penalty = (usage[d] + layer.expert_size_bytes) / max(1, cap)
+                load_penalty = (usage[d] + expert_size) / max(1, cap)
             score = (weights[d] * (1.0 + freq)) - load_penalty
             if best_score is None or score > best_score:
                 best_score = score
                 chosen = d
 
         if chosen is None:
-            chosen = default_device
+            cap_text = ", ".join(
+                f"cuda:{d}={device_capacities[d] / 1024**3:.2f} GiB"
+                for d in active_devices
+                if device_capacities and d in device_capacities
+            ) or "no capacities provided"
+            raise RuntimeError(
+                f"Cannot place expert {expert_idx} of layer {layer.layer_key!r}: "
+                f"all configured expert capacities are exhausted ({cap_text})"
+            )
 
         out.setdefault(layer.layer_idx if layer.layer_idx is not None else layer.layer_key, {})[expert_idx] = chosen
-        usage[chosen] += layer.expert_size_bytes
+        usage[chosen] += layer.expert_size(expert_idx)
 
     return out
 
@@ -254,9 +408,9 @@ def estimate_override_bytes_per_device(
         )
         if not overrides:
             continue
-        for _, device_idx in overrides.items():
+        for expert_idx, device_idx in overrides.items():
             if default_device is not None and device_idx == default_device:
                 continue
             if device_idx in out:
-                out[device_idx] += layer.expert_size_bytes
+                out[device_idx] += layer.expert_size(expert_idx)
     return out
