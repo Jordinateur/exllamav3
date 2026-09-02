@@ -3,6 +3,7 @@ from functools import cached_property
 from typing import Callable
 import torch
 import json
+import os
 from .config import Config
 from ..util import parse_int_list
 from ..util.memory import free_mem
@@ -326,6 +327,21 @@ class Model(Model_TPMixin, Model_LSMixin):
         return specs
 
 
+    def _expert_reserve_with_safety(self, bytes_per_device: dict[int, int]) -> dict[int, int]:
+        # Conservative headroom for allocator fragmentation and small runtime buffers while expert
+        # placement is active. Tunable for tight systems.
+        margin_mb = int(os.environ.get("EXL3_MOE_EXPERT_RESERVE_MB", "1024"))
+        ratio = float(os.environ.get("EXL3_MOE_EXPERT_RESERVE_RATIO", "1.05"))
+        margin = margin_mb * 1024**2
+        out = {}
+        for d, b in bytes_per_device.items():
+            if b <= 0:
+                out[d] = 0
+            else:
+                out[d] = int(b * ratio) + margin
+        return out
+
+
     def load_gen(
         self,
         device: torch.device | str | int | None = None,
@@ -537,6 +553,7 @@ class Model(Model_TPMixin, Model_LSMixin):
                     active_devices = active_devices,
                     default_device = profile_default_device,
                 )
+                profile_override_bytes = self._expert_reserve_with_safety(profile_override_bytes)
                 if upd:
                     for d, extra in profile_override_bytes.items():
                         if extra <= 0:
@@ -572,6 +589,7 @@ class Model(Model_TPMixin, Model_LSMixin):
                     self.config.infer_params.expert_device_map,
                     active_devices = active_devices,
                 )
+                override_bytes = self._expert_reserve_with_safety(override_bytes)
                 if upd:
                     for d, extra in override_bytes.items():
                         if extra <= 0:

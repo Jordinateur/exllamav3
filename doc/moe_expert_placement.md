@@ -100,3 +100,6 @@ Manual overrides can be merged on top of profile-generated maps.
 - Cross-device experts require activation/result transfer for routed tokens.
 - This first implementation prioritizes correctness and compatibility.
 - Quantized fused MoE fast paths are disabled when cross-device expert placement is active for a layer.
+- Autosplit headroom can be tuned with:
+  - `EXL3_MOE_EXPERT_RESERVE_MB` (default `1024`)
+  - `EXL3_MOE_EXPERT_RESERVE_RATIO` (default `1.05`)
