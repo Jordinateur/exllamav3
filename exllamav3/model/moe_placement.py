@@ -224,3 +224,37 @@ def allocate_experts_from_profile(
 
     return out
 
+
+def estimate_override_bytes_per_device(
+    layer_specs: list[MoeLayerPlanInput],
+    normalized_map: NormalizedExpertMap,
+    *,
+    active_devices: list[int] | None = None,
+) -> dict[int, int]:
+    """
+    Conservative accounting of bytes that may need to be allocated on each device due to explicit
+    expert overrides. This is used to reserve room before autosplit so later module placement
+    doesn't consume memory needed by relocated experts.
+    """
+    if active_devices is None:
+        devices = sorted({
+            d for layer in normalized_map.values() for d in layer.values()
+        })
+    else:
+        devices = list(active_devices)
+    out = {d: 0 for d in devices}
+    if not normalized_map:
+        return out
+
+    for layer in layer_specs:
+        overrides = resolve_layer_expert_overrides(
+            normalized_map,
+            layer_idx = layer.layer_idx,
+            layer_key = layer.layer_key,
+        )
+        if not overrides:
+            continue
+        for _, device_idx in overrides.items():
+            if device_idx in out:
+                out[device_idx] += layer.expert_size_bytes
+    return out

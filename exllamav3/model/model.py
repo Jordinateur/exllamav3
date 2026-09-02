@@ -14,6 +14,7 @@ from .moe_placement import (
     normalize_expert_device_map,
     MoeLayerPlanInput,
     allocate_experts_from_profile,
+    estimate_override_bytes_per_device,
 )
 from ..modules.block_sparse_mlp import BlockSparseMLP
 
@@ -301,6 +302,18 @@ class Model(Model_TPMixin, Model_LSMixin):
         if isinstance(profile, str):
             with open(profile, "r", encoding = "utf8") as f:
                 profile = json.load(f)
+        specs = self._moe_layer_specs()
+        return allocate_experts_from_profile(
+            specs,
+            profile,
+            active_devices = active_devices,
+            device_weights = device_weights,
+            device_capacities = device_capacities,
+            default_device = default_device,
+        )
+
+
+    def _moe_layer_specs(self) -> list[MoeLayerPlanInput]:
         specs = []
         for module in self:
             if isinstance(module, BlockSparseMLP):
@@ -310,14 +323,7 @@ class Model(Model_TPMixin, Model_LSMixin):
                     num_experts = module.num_experts,
                     expert_size_bytes = module.estimate_expert_storage_size(),
                 ))
-        return allocate_experts_from_profile(
-            specs,
-            profile,
-            active_devices = active_devices,
-            device_weights = device_weights,
-            device_capacities = device_capacities,
-            default_device = default_device,
-        )
+        return specs
 
 
     def load_gen(
@@ -526,6 +532,35 @@ class Model(Model_TPMixin, Model_LSMixin):
                     merged.setdefault(lk, {}).update(lv)
                 self.config.infer_params.expert_device_map = merged
                 self.config.expert_device_map = merged
+
+            # Expert-aware placement can allocate expert tensors on devices other than the module's
+            # autosplit load device. Reserve that room conservatively up front so autosplit does
+            # not overfill a target device with dense modules first.
+            if self.config.infer_params.expert_device_map and not tensor_p:
+                override_bytes = estimate_override_bytes_per_device(
+                    self._moe_layer_specs(),
+                    self.config.infer_params.expert_device_map,
+                    active_devices = active_devices,
+                )
+                if upd:
+                    for d, extra in override_bytes.items():
+                        if extra <= 0:
+                            continue
+                        if d >= len(use_per_device):
+                            continue
+                        use_per_device[d] -= extra
+                        if use_per_device[d] <= 0:
+                            raise RuntimeError(
+                                f"expert-aware placement reserves too much memory on cuda:{d}; "
+                                f"reduce expert map pressure or increase --gpu_split/--moe_device_caps"
+                            )
+                else:
+                    for d, extra in override_bytes.items():
+                        if extra <= 0:
+                            continue
+                        if d >= len(reserve_per_device):
+                            continue
+                        reserve_per_device[d] += extra
 
             # Split load
             if not tensor_p:

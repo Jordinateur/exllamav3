@@ -16,6 +16,7 @@ normalize_expert_device_map = _MOD.normalize_expert_device_map
 resolve_layer_expert_overrides = _MOD.resolve_layer_expert_overrides
 resolve_profile_layer = _MOD.resolve_profile_layer
 validate_layer_overrides = _MOD.validate_layer_overrides
+estimate_override_bytes_per_device = _MOD.estimate_override_bytes_per_device
 
 
 class TestMoeExpertPlacement(unittest.TestCase):
@@ -83,6 +84,20 @@ class TestMoeExpertPlacement(unittest.TestCase):
             default_device = 0,
         )
         self.assertTrue(any(v == 1 for layer in m.values() for v in layer.values()))
+
+    def test_estimate_override_bytes_per_device(self):
+        m = normalize_expert_device_map({
+            0: {1: 2, 2: 2},
+            "model.layers.1.mlp": {0: 1},
+        })
+        specs = [
+            MoeLayerPlanInput("model.layers.0.mlp", 0, 4, 100),
+            MoeLayerPlanInput("model.layers.1.mlp", 1, 4, 50),
+        ]
+        b = estimate_override_bytes_per_device(specs, m, active_devices = [0, 1, 2])
+        self.assertEqual(b[2], 200)
+        self.assertEqual(b[1], 50)
+        self.assertEqual(b[0], 0)
 
 if __name__ == "__main__":
     unittest.main()
