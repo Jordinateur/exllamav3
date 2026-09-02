@@ -15,6 +15,11 @@ from .block_sparse_mlp_cpu import BlockSparseMLP_CPU
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
 from ..util.tensor import g_tensor_cache, buffered_interleaved_arange
+from ..model.moe_placement import (
+    resolve_layer_expert_overrides,
+    validate_layer_overrides,
+)
+import re
 
 TEMP_ROWS_FUSED = 128
 TEMP_ROWS_GRAPH = 32
@@ -623,6 +628,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.bc = None
         self.bc_sh_exp = False
         self.fused_mode_buffers = None
+        self.expert_device = None
+        self.expert_device_set = None
+        self.expert_device_enabled = False
+        self.expert_profile_enabled = False
+        self.expert_profile_counts = None
         self._cpu_init_state()
 
     @override
@@ -636,6 +646,43 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             return [s, [g + u, d]]
         else:
             return [[g + u, d]]
+
+
+    def infer_layer_idx(self) -> int | None:
+        m = re.search(r"\.layers\.(\d+)\.", self.key)
+        return int(m.group(1)) if m else None
+
+
+    def estimate_expert_storage_size(self) -> int:
+        if self.num_experts == 0:
+            return 0
+        i = 0
+        sz = self.ups[i].storage_size() + self.downs[i].storage_size()
+        if self.gated:
+            sz += self.gates[i].storage_size()
+        return sz
+
+
+    def enable_expert_profiling(self, enabled: bool = True, reset: bool = False):
+        self.expert_profile_enabled = enabled
+        if reset:
+            self.expert_profile_counts = None
+
+
+    def reset_expert_statistics(self):
+        self.expert_profile_counts = None
+
+
+    def get_expert_statistics(self, normalized: bool = False) -> list[float] | list[int] | None:
+        if self.expert_profile_counts is None:
+            return None
+        counts = self.expert_profile_counts.detach().cpu().tolist()
+        if not normalized:
+            return [int(x) for x in counts]
+        s = sum(counts)
+        if s <= 0:
+            return [0.0 for _ in counts]
+        return [float(x) / float(s) for x in counts]
 
 
     def load_local(self, **kwargs):
@@ -919,6 +966,94 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         )
 
 
+    def _get_expert_device_overrides(self) -> dict[int, int]:
+        raw_map = getattr(self.config.infer_params, "expert_device_map", {})
+        return resolve_layer_expert_overrides(raw_map, self.infer_layer_idx(), self.key)
+
+
+    def _apply_expert_device_placement(self):
+        overrides = self._get_expert_device_overrides()
+        if not overrides:
+            self.expert_device = None
+            self.expert_device_set = None
+            self.expert_device_enabled = False
+            return
+
+        num_devices = torch.cuda.device_count()
+        validate_layer_overrides(
+            overrides,
+            layer_name = self.key,
+            num_experts = self.num_experts,
+            num_devices = num_devices,
+        )
+
+        if self.routing_device is not None:
+            raise NotImplementedError(f"{self.key}: expert_device_map is not supported with tensor parallel")
+        if self.cpu_offload or self.cpu_split_first is not None:
+            raise NotImplementedError(f"{self.key}: expert_device_map is not supported with CPU MoE offload/split")
+
+        base_idx = torch.device(self.device).index
+        assert base_idx is not None
+        per_expert_device = [base_idx] * self.num_experts
+        for expert_idx, device_idx in overrides.items():
+            per_expert_device[expert_idx] = device_idx
+
+        # Keep quantized fused paths disabled for cross-device experts in phase 1.
+        if self.expert_device_enabled:
+            self.bc = None
+            self.multi_gate = None
+            self.multi_up = None
+            self.multi_down = None
+            self.fused_mode_buffers = None
+            self.support_fused = False
+            self.support_quant_paths = False
+            self.is_quantized = False
+
+        for expert_idx, device_idx in enumerate(per_expert_device):
+            if device_idx == base_idx:
+                continue
+            target = torch.device(f"cuda:{device_idx}")
+            if self.gated:
+                self.gates[expert_idx].unload()
+                self.gates[expert_idx].load(target)
+            self.ups[expert_idx].unload()
+            self.ups[expert_idx].load(target)
+            self.downs[expert_idx].unload()
+            self.downs[expert_idx].load(target)
+
+        self.expert_device = torch.tensor(per_expert_device, dtype = torch.long, device = self.device)
+        self.expert_device_set = sorted(set(per_expert_device))
+        self.expert_device_enabled = any(d != base_idx for d in per_expert_device)
+
+
+    def _load_with_expert_device_map(self, device: torch.Device, per_expert_device: list[int], **kwargs):
+        self.device = torch.device(device)
+
+        expert_modules = set((self.gates if self.gated else []) + self.ups + self.downs)
+        for module in self.modules:
+            if module not in expert_modules:
+                module.load(self.device, **kwargs)
+
+        for expert_idx, device_idx in enumerate(per_expert_device):
+            target = torch.device(f"cuda:{device_idx}")
+            if self.gated:
+                self.gates[expert_idx].load(target, **kwargs)
+            self.ups[expert_idx].load(target, **kwargs)
+            self.downs[expert_idx].load(target, **kwargs)
+
+        self.expert_device = torch.tensor(per_expert_device, dtype = torch.long, device = self.device)
+        self.expert_device_set = sorted(set(per_expert_device))
+        base_idx = torch.device(self.device).index
+        self.expert_device_enabled = any(d != base_idx for d in per_expert_device)
+
+
+    @override
+    def can_defer_load(self):
+        if self._get_expert_device_overrides():
+            return False
+        return super().can_defer_load()
+
+
     @override
     def load(self, device: torch.Device, **kwargs):
         # CPU expert offload (see block_sparse_mlp_cpu.py): a whole-layer claim replaces the
@@ -926,7 +1061,42 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if self.cpu_maybe_offload_load(device, **kwargs):
             return
         self.cpu_maybe_split_load(device, **kwargs)
-        super().load(device, **kwargs)
+        expert_overrides = self._get_expert_device_overrides()
+        use_expert_map = (
+            bool(expert_overrides) and
+            device is not None and torch.device(device).type == "cuda"
+        )
+        if use_expert_map:
+            num_devices = torch.cuda.device_count()
+            validate_layer_overrides(
+                expert_overrides,
+                layer_name = self.key,
+                num_experts = self.num_experts,
+                num_devices = num_devices,
+            )
+            if self.routing_device is not None:
+                raise NotImplementedError(f"{self.key}: expert_device_map is not supported with tensor parallel")
+            if self.cpu_offload or self.cpu_split_first is not None:
+                raise NotImplementedError(f"{self.key}: expert_device_map is not supported with CPU MoE offload/split")
+
+            base_idx = torch.device(device).index
+            assert base_idx is not None
+            per_expert_device = [base_idx] * self.num_experts
+            for expert_idx, device_idx in expert_overrides.items():
+                per_expert_device[expert_idx] = device_idx
+            self._load_with_expert_device_map(device, per_expert_device, **kwargs)
+
+            # Keep quantized fused paths disabled for cross-device experts in phase 1.
+            self.bc = None
+            self.multi_gate = None
+            self.multi_up = None
+            self.multi_down = None
+            self.fused_mode_buffers = None
+            self.support_fused = False
+            self.support_quant_paths = False
+            self.is_quantized = False
+        else:
+            super().load(device, **kwargs)
 
         if self.e_score_correction_bias_key:
             for k in [self.e_score_correction_bias_key, "gate.e_score_correction_bias"]:
@@ -955,7 +1125,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             )
         if device is not None and torch.device(device).type == "cuda":
             self.cpu_post_load()
-            self.load_local(**kwargs)
+            if not self.expert_device_enabled:
+                self.load_local(**kwargs)
             self.load_routing(**kwargs)
 
 
@@ -980,6 +1151,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.per_expert_scale = None
         self.bcast_sel_bsz1 = None
         self.bcast_weights_bsz1 = None
+        self.expert_device = None
+        self.expert_device_set = None
+        self.expert_device_enabled = False
+        self.expert_profile_counts = None
         super().unload()
 
 
@@ -1035,6 +1210,12 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if self.routing_device is not None:
             params["backend"].broadcast(selected_experts, src_device = self.routing_device)
             params["backend"].broadcast(routing_weights, src_device = self.routing_device)
+
+        if self.expert_profile_enabled:
+            counts = torch.bincount(selected_experts.view(-1), minlength = self.num_experts)
+            if self.expert_profile_counts is None or self.expert_profile_counts.device != counts.device:
+                self.expert_profile_counts = torch.zeros(self.num_experts, dtype = torch.long, device = counts.device)
+            self.expert_profile_counts += counts.to(torch.long)
 
         # CPU expert offload (block_sparse_mlp_cpu.py): split layers hand the tail experts'
         # share to the worker now so it computes concurrently with the GPU expert paths below
@@ -1173,6 +1354,13 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                     w = weight_sorted[start:end].unsqueeze(1)
 
                     current_state = y.index_select(0, top_x)
+                    if self.expert_device_enabled:
+                        expert_dev_idx = int(self.expert_device[expert_idx].item())
+                        expert_dev = torch.device(f"cuda:{expert_dev_idx}")
+                        if current_state.device != expert_dev:
+                            current_state = current_state.to(expert_dev)
+                    else:
+                        expert_dev = current_state.device
 
                     if self.bc is not None and self.support_quant_paths:
                         # Graph path
@@ -1220,7 +1408,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
                         current_state = mlp(expert_idx, current_state)
 
+                    if w.device != expert_dev:
+                        w = w.to(expert_dev)
                     current_state.mul_(w)
+                    if current_state.device != final_hidden_states.device:
+                        current_state = current_state.to(final_hidden_states.device)
                     final_hidden_states.index_add_(0, top_x, current_state)
                     start = end
 

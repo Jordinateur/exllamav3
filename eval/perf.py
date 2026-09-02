@@ -180,6 +180,8 @@ def main(args):
         print(f" !! max_length cannot exceed cache size, limiting to {args.max_length}")
 
     model, config, cache, tokenizer = model_init.init(args, max_chunk_size = args.chunk_size)
+    if args.profile_experts:
+        model.enable_expert_profiling(reset = True)
     load_workload_ids(tokenizer, args.max_length + 512)
     bpw_layer, bpw_head, vram_bits = model.get_storage_info()
 
@@ -205,6 +207,13 @@ def main(args):
         generate_results = measure_generate(args, model, cache)
         print()
 
+    if args.profile_experts:
+        stats = model.get_expert_statistics(normalized = True)
+        if args.expert_profile_out:
+            model.save_expert_profile(args.expert_profile_out, normalized = True)
+            print(f" -- Saved expert profile: {args.expert_profile_out}")
+        print(f" -- Profiled MoE layers: {len(stats.get('layers', {}))}")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(allow_abbrev = False)
@@ -220,5 +229,7 @@ if __name__ == "__main__":
     parser.add_argument("-swu", "--skip_warmup", action = "store_true", help = "Skip warmup passes")
     parser.add_argument("-short", "--short_prefill", action = "store_true", help = "Test short-prefill/batch throughput")
     parser.add_argument("-sd", "--spec_dec", action = "store_true", help = "Test spec-decode seqlens 1..4")
+    parser.add_argument("--profile_experts", action = "store_true", help = "Collect per-layer expert routing statistics")
+    parser.add_argument("--expert_profile_out", type = str, default = None, help = "Save normalized expert profile JSON")
     _args = parser.parse_args()
     main(_args)

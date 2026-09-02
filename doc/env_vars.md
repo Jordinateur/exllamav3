@@ -377,6 +377,12 @@ component.
 
 ## Multi-GPU
 
+### Expert-aware MoE placement
+
+See `/home/runner/work/exllamav3/exllamav3/doc/moe_expert_placement.md` for the experimental
+expert-aware MoE placement feature (manual expert maps, profile-based static placement, and
+profiling APIs). This is configured through runtime APIs / CLI args, not environment variables.
+
 ### `EXLLAMA_NO_P2P_COPY` (default: unset)
 
 When set, device-to-device tensor moves in the layer split bounce through host memory instead

@@ -2,6 +2,7 @@ from __future__ import annotations
 from functools import cached_property
 from typing import Callable
 import torch
+import json
 from .config import Config
 from ..util import parse_int_list
 from ..util.memory import free_mem
@@ -9,6 +10,13 @@ from .model_tp import Model_TPMixin
 from .model_ls import Model_LSMixin
 from ..util.tensor import g_tensor_cache
 from ..cache.recurrent_util import advance_recurrent_states
+from .moe_placement import (
+    normalize_expert_device_map,
+    MoeLayerPlanInput,
+    allocate_experts_from_profile,
+    estimate_override_bytes_per_device,
+)
+from ..modules.block_sparse_mlp import BlockSparseMLP
 
 class Model(Model_TPMixin, Model_LSMixin):
 
@@ -238,6 +246,86 @@ class Model(Model_TPMixin, Model_LSMixin):
                 cache.initialized = False
 
 
+    def enable_expert_profiling(self, reset: bool = True):
+        for module in self:
+            if isinstance(module, BlockSparseMLP):
+                module.enable_expert_profiling(reset = reset)
+
+
+    def disable_expert_profiling(self):
+        for module in self:
+            if isinstance(module, BlockSparseMLP):
+                module.enable_expert_profiling(False)
+
+
+    def get_expert_statistics(self, normalized: bool = False) -> dict:
+        layers = {}
+        for module in self:
+            if isinstance(module, BlockSparseMLP):
+                stats = module.get_expert_statistics(normalized = normalized)
+                if stats is not None:
+                    layers[module.key] = stats
+        return {
+            "version": 1,
+            "model_architecture": self.config.architecture,
+            "num_layers": self.config.num_hidden_layers,
+            "layers": layers,
+        }
+
+
+    def reset_expert_statistics(self):
+        for module in self:
+            if isinstance(module, BlockSparseMLP):
+                module.reset_expert_statistics()
+
+
+    def save_expert_profile(self, path: str, normalized: bool = True):
+        with open(path, "w", encoding = "utf8") as f:
+            json.dump(self.get_expert_statistics(normalized = normalized), f, indent = 2)
+
+
+    def load_expert_profile(self, path: str) -> dict:
+        with open(path, "r", encoding = "utf8") as f:
+            profile = json.load(f)
+        return profile
+
+
+    def plan_expert_placement_from_profile(
+        self,
+        profile: dict | str,
+        *,
+        active_devices: list[int],
+        device_weights: dict[int, float] | None = None,
+        device_capacities: dict[int, int] | None = None,
+        default_device: int | None = None,
+    ) -> dict:
+        if isinstance(profile, str):
+            with open(profile, "r", encoding = "utf8") as f:
+                profile = json.load(f)
+        specs = self._moe_layer_specs()
+        return allocate_experts_from_profile(
+            specs,
+            profile,
+            active_devices = active_devices,
+            device_weights = device_weights,
+            device_capacities = device_capacities,
+            default_device = default_device,
+        )
+
+
+    def _moe_layer_specs(self) -> list[MoeLayerPlanInput]:
+        specs = []
+        for module in self:
+            if isinstance(module, BlockSparseMLP):
+                specs.append(MoeLayerPlanInput(
+                    layer_key = module.key,
+                    layer_idx = module.infer_layer_idx(),
+                    num_experts = module.num_experts,
+                    expert_size_bytes = module.estimate_expert_storage_size(),
+                ))
+        return specs
+
+
     def load_gen(
         self,
         device: torch.device | str | int | None = None,
@@ -353,9 +441,22 @@ class Model(Model_TPMixin, Model_LSMixin):
         # Route CPU-offloaded MoE layers to this component's own worker and budget (an MTP head
         # shares the config but loads after the main model's worker has already started)
         self.config.infer_params.moe_cpu_component = getattr(self, "component", "text")
+        self.config.infer_params.expert_device_map = normalize_expert_device_map(
+            getattr(self.config.infer_params, "expert_device_map", {})
+        )
+        self.config.expert_device_map = self.config.infer_params.expert_device_map
 
         assert not (bool(reserve_per_device) and bool(use_per_device)), \
             "Cannot specify both memory usage and memory reserve."
+
+        if tensor_p and (self.config.infer_params.expert_device_map or self.config.infer_params.expert_profile):
+            raise NotImplementedError("expert-aware MoE placement is currently supported in layer-split mode only")
+        if self.config.infer_params.expert_device_map and (
+            self.config.infer_params.moe_cpu_offload or
+            self.config.infer_params.moe_cpu_split or
+            self.config.infer_params.draft_moe_cpu_offload
+        ):
+            raise NotImplementedError("expert_device_map is not supported with moe_cpu_offload/moe_cpu_split")
 
         assert max_chunk_size >= 1, "max_chunk_size must be positive"
         assert max_output_size >= 1, "max_output_size must be positive"
@@ -367,6 +468,20 @@ class Model(Model_TPMixin, Model_LSMixin):
                 "Cannot specify reserve_per_device or use_per_device when loading to single device."
             assert not tensor_p, \
                 "Cannot use tensor_p when loading to single device."
+            if self.config.infer_params.expert_profile:
+                dev_idx = torch.device(device).index or 0
+                prof_map = self.plan_expert_placement_from_profile(
+                    self.config.infer_params.expert_profile,
+                    active_devices = [dev_idx],
+                    device_weights = self.config.infer_params.moe_device_weights,
+                    device_capacities = self.config.infer_params.moe_device_capacities,
+                    default_device = dev_idx,
+                )
+                merged = normalize_expert_device_map(self.config.infer_params.expert_device_map)
+                for lk, lv in prof_map.items():
+                    merged.setdefault(lk, {}).update(lv)
+                self.config.infer_params.expert_device_map = merged
+                self.config.expert_device_map = merged
             self._load_single(progressbar, device, self.config, self.modules, verbose)
             self.output_device = self.modules[-1].device
 
@@ -376,6 +491,7 @@ class Model(Model_TPMixin, Model_LSMixin):
             upd = use_per_device is not None
             assert not (rpd and upd), \
                 "Cannot specify both reserve_per_device or use_per_device."
+            profile_reserved = False
             num_devices = torch.cuda.device_count()
 
             if not upd:
@@ -403,6 +519,78 @@ class Model(Model_TPMixin, Model_LSMixin):
                     i for i, x in enumerate(use_per_device)
                     if x > 0
                 ]
+
+            if self.config.infer_params.expert_profile:
+                profile_default_device = active_devices[0] if active_devices else None
+                prof_map = self.plan_expert_placement_from_profile(
+                    self.config.infer_params.expert_profile,
+                    active_devices = active_devices,
+                    device_weights = self.config.infer_params.moe_device_weights,
+                    device_capacities = self.config.infer_params.moe_device_capacities,
+                    default_device = profile_default_device,
+                )
+                # Reserve extra room for profile-assigned experts that are placed off the profile
+                # default device before autosplit starts assigning dense modules.
+                profile_override_bytes = estimate_override_bytes_per_device(
+                    self._moe_layer_specs(),
+                    prof_map,
+                    active_devices = active_devices,
+                    default_device = profile_default_device,
+                )
+                if upd:
+                    for d, extra in profile_override_bytes.items():
+                        if extra <= 0:
+                            continue
+                        if d >= len(use_per_device):
+                            continue
+                        use_per_device[d] -= extra
+                        if use_per_device[d] <= 0:
+                            raise RuntimeError(
+                                f"expert profile placement reserves too much memory on cuda:{d}; "
+                                f"reduce profile pressure or increase --gpu_split/--moe_device_caps"
+                            )
+                else:
+                    for d, extra in profile_override_bytes.items():
+                        if extra <= 0:
+                            continue
+                        if d >= len(reserve_per_device):
+                            continue
+                        reserve_per_device[d] += extra
+                profile_reserved = True
+                merged = normalize_expert_device_map(self.config.infer_params.expert_device_map)
+                for lk, lv in prof_map.items():
+                    merged.setdefault(lk, {}).update(lv)
+                self.config.infer_params.expert_device_map = merged
+                self.config.expert_device_map = merged
+
+            # Expert-aware placement can allocate expert tensors on devices other than the module's
+            # autosplit load device. Reserve that room conservatively up front so autosplit does
+            # not overfill a target device with dense modules first.
+            if self.config.infer_params.expert_device_map and not tensor_p and not profile_reserved:
+                override_bytes = estimate_override_bytes_per_device(
+                    self._moe_layer_specs(),
+                    self.config.infer_params.expert_device_map,
+                    active_devices = active_devices,
+                )
+                if upd:
+                    for d, extra in override_bytes.items():
+                        if extra <= 0:
+                            continue
+                        if d >= len(use_per_device):
+                            continue
+                        use_per_device[d] -= extra
+                        if use_per_device[d] <= 0:
+                            raise RuntimeError(
+                                f"expert-aware placement reserves too much memory on cuda:{d}; "
+                                f"reduce expert map pressure or increase --gpu_split/--moe_device_caps"
+                            )
+                else:
+                    for d, extra in override_bytes.items():
+                        if extra <= 0:
+                            continue
+                        if d >= len(reserve_per_device):
+                            continue
+                        reserve_per_device[d] += extra
 
             # Split load
             if not tensor_p:
