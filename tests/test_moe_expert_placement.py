@@ -83,6 +83,8 @@ class TestMoeExpertPlacement(unittest.TestCase):
             device_capacities = {0: 40, 1: 80},
             default_device = 0,
         )
+        self.assertEqual(len(m[0]), 4)
+        self.assertEqual(len(m[1]), 4)
         self.assertTrue(any(v == 1 for layer in m.values() for v in layer.values()))
 
     def test_estimate_override_bytes_per_device(self):
@@ -98,6 +100,8 @@ class TestMoeExpertPlacement(unittest.TestCase):
         self.assertEqual(b[2], 200)
         self.assertEqual(b[1], 50)
         self.assertEqual(b[0], 0)
+        b2 = estimate_override_bytes_per_device(specs, m, active_devices = [0, 1, 2], default_device = 2)
+        self.assertEqual(b2[2], 0)
 
 if __name__ == "__main__":
     unittest.main()

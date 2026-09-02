@@ -491,6 +491,7 @@ class Model(Model_TPMixin, Model_LSMixin):
             upd = use_per_device is not None
             assert not (rpd and upd), \
                 "Cannot specify both reserve_per_device or use_per_device."
+            profile_reserved = False
             num_devices = torch.cuda.device_count()
 
             if not upd:
@@ -520,13 +521,42 @@ class Model(Model_TPMixin, Model_LSMixin):
                 ]
 
             if self.config.infer_params.expert_profile:
+                profile_default_device = active_devices[0] if active_devices else None
                 prof_map = self.plan_expert_placement_from_profile(
                     self.config.infer_params.expert_profile,
                     active_devices = active_devices,
                     device_weights = self.config.infer_params.moe_device_weights,
                     device_capacities = self.config.infer_params.moe_device_capacities,
-                    default_device = active_devices[0] if active_devices else None,
+                    default_device = profile_default_device,
                 )
+                # Reserve extra room for profile-assigned experts that are placed off the profile
+                # default device before autosplit starts assigning dense modules.
+                profile_override_bytes = estimate_override_bytes_per_device(
+                    self._moe_layer_specs(),
+                    prof_map,
+                    active_devices = active_devices,
+                    default_device = profile_default_device,
+                )
+                if upd:
+                    for d, extra in profile_override_bytes.items():
+                        if extra <= 0:
+                            continue
+                        if d >= len(use_per_device):
+                            continue
+                        use_per_device[d] -= extra
+                        if use_per_device[d] <= 0:
+                            raise RuntimeError(
+                                f"expert profile placement reserves too much memory on cuda:{d}; "
+                                f"reduce profile pressure or increase --gpu_split/--moe_device_caps"
+                            )
+                else:
+                    for d, extra in profile_override_bytes.items():
+                        if extra <= 0:
+                            continue
+                        if d >= len(reserve_per_device):
+                            continue
+                        reserve_per_device[d] += extra
+                profile_reserved = True
                 merged = normalize_expert_device_map(self.config.infer_params.expert_device_map)
                 for lk, lv in prof_map.items():
                     merged.setdefault(lk, {}).update(lv)
@@ -536,7 +566,7 @@ class Model(Model_TPMixin, Model_LSMixin):
             # Expert-aware placement can allocate expert tensors on devices other than the module's
             # autosplit load device. Reserve that room conservatively up front so autosplit does
             # not overfill a target device with dense modules first.
-            if self.config.infer_params.expert_device_map and not tensor_p:
+            if self.config.infer_params.expert_device_map and not tensor_p and not profile_reserved:
                 override_bytes = estimate_override_bytes_per_device(
                     self._moe_layer_specs(),
                     self.config.infer_params.expert_device_map,

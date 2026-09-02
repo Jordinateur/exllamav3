@@ -218,8 +218,7 @@ def allocate_experts_from_profile(
         if chosen is None:
             chosen = default_device
 
-        if chosen != default_device:
-            out.setdefault(layer.layer_idx if layer.layer_idx is not None else layer.layer_key, {})[expert_idx] = chosen
+        out.setdefault(layer.layer_idx if layer.layer_idx is not None else layer.layer_key, {})[expert_idx] = chosen
         usage[chosen] += layer.expert_size_bytes
 
     return out
@@ -230,6 +229,7 @@ def estimate_override_bytes_per_device(
     normalized_map: NormalizedExpertMap,
     *,
     active_devices: list[int] | None = None,
+    default_device: int | None = None,
 ) -> dict[int, int]:
     """
     Conservative accounting of bytes that may need to be allocated on each device due to explicit
@@ -255,6 +255,8 @@ def estimate_override_bytes_per_device(
         if not overrides:
             continue
         for _, device_idx in overrides.items():
+            if default_device is not None and device_idx == default_device:
+                continue
             if device_idx in out:
                 out[device_idx] += layer.expert_size_bytes
     return out
